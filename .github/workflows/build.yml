@@ -1,0 +1,154 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  COREPACK_ENABLE_PROJECT_SPEC: "0"
+  ELECTRON_MIRROR: "https://npmmirror.com/mirrors/electron/"
+  # 与 mise.toml 对齐；CI 用 actions/setup-node + pnpm/action-setup 固定版本。
+  NODE_VERSION: "24.14.0"
+  PNPM_VERSION: "10.33.2"
+
+jobs:
+  verify:
+    name: typecheck + lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Lint
+        run: pnpm lint
+
+      # 格式检查只做提示不阻断：上游未带 CI，fmt:check 从未在流水线验证过，
+      # 且它不参与产物构建。typecheck + lint 才是正确性门禁。
+      - name: Format check
+        continue-on-error: true
+        run: pnpm fmt:check
+
+  desktop-windows:
+    name: desktop win-x64
+    runs-on: windows-latest
+    timeout-minutes: 90
+    needs: verify
+    steps:
+      - uses: actions/checkout@v4
+
+      # 内置插件层运行时素材（glm/packages + tools/cua-helper）在私有仓里，
+      # 不随源码分发。这里拉到 bundled-resources/（该路径在 .gitignore 内）参与打包。
+      - name: Checkout runtime assets (private)
+        uses: actions/checkout@v4
+        with:
+          repository: Keeperorowner/zcode-runtime-assets
+          path: packages/desktop/bundled-resources
+          token: ${{ secrets.ZCODE_RUNTIME_ASSETS_TOKEN }}
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify runtime assets integrity
+        shell: pwsh
+        run: |
+          $manifest = "packages/desktop/bundled-resources/MANIFEST.sha256"
+          if (-not (Test-Path $manifest)) { Write-Error "MANIFEST.sha256 missing"; exit 1 }
+          $bad = 0
+          Get-Content $manifest | ForEach-Object {
+            $hash, $rel = $_ -split '\s+', 2
+            if (-not $rel) { return }
+            $p = Join-Path "packages/desktop/bundled-resources" $rel
+            if (-not (Test-Path $p)) { Write-Host "MISSING $rel"; $bad++ ; return }
+            $actual = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLower()
+            if ($actual -ne $hash) { Write-Host "MISMATCH $rel"; $bad++ }
+          }
+          if ($bad -gt 0) { Write-Error "$bad runtime asset(s) failed integrity check"; exit 1 }
+          Write-Host "runtime assets integrity OK"
+
+      - name: Prepare desktop runtime assets
+        run: pnpm prepare:desktop-runtime
+
+      - name: Build desktop (win-x64)
+        # ZCODE_ENV=production 一并决定三件事（见 packages/desktop/scripts/
+        # desktop-product-identity.mjs）：productName 取「ZCode」而非「ZCode Preview」、
+        # 产物文件名不带 _TEST 后缀、后端走生产端点。flavor 与后端环境是同一开关，
+        # test 环境会被强制成 Preview 身份，避免测试包覆盖用户的正式安装。
+        env:
+          ZCODE_ENV: production
+        run: pnpm bundle:desktop -- --os win --arch x64
+
+      - name: Upload desktop artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zcode-desktop-win-x64
+          path: packages/desktop/dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  zcode-cli:
+    name: zcode CLI distribution
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: verify
+    # 上游 SEA 打包要求 workspace 包先产出 dist/，但开源树里若干包的 build 脚本被裁掉了，
+    # 且 @zcode/zcode-cua 是扁平 .js 结构、不产出 dist。这里尽力构建，不阻断主产物
+    # （desktop win-x64）。typecheck + lint 才是正确性门禁。
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build zcode CLI distribution
+        # ZCODE_DIST_BASE_URL 只写进 install.sh 的下载根，不影响产物本身。
+        env:
+          ZCODE_DIST_BASE_URL: https://example.invalid/zcode/
+        run: pnpm build:zcode --base-url https://example.invalid/zcode/
+
+      - name: Upload zcode CLI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zcode-cli-dist
+          path: dist/zcode/
+          if-no-files-found: error
+          retention-days: 14
